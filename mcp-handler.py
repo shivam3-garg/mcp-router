@@ -2,16 +2,22 @@ import asyncio
 import json
 import uuid
 import os
+import logging
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
 from langchain_anthropic import ChatAnthropic
 from mcp_use import MCPAgent, MCPClient
-import logging
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# Set up logging with maximum verbosity
+logging.basicConfig(
+    level=logging.DEBUG,  # Changed from INFO to DEBUG
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
+
+# Ensure Flask/Werkzeug logs are captured
+logging.getLogger('werkzeug').setLevel(logging.DEBUG)
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -24,7 +30,7 @@ if not ANTHROPIC_API_KEY:
     logger.error("ANTHROPIC_API_KEY not set in environment variables")
     raise ValueError("ANTHROPIC_API_KEY is required")
 
-# System prompt
+# System prompt (unchanged)
 SYSTEM_PROMPT = """
 You are a Paytm MCP Assistant, an AI agent powered by the Paytm MCP Server, which enables secure access to Paytm's Payments and Business Payments APIs. Your role is to automate payment workflows using the available tools: `create_link`, `fetch_link`, and `fetch_transaction`. Follow these steps for every request:
 
@@ -38,9 +44,7 @@ You are a Paytm MCP Assistant, an AI agent powered by the Paytm MCP Server, whic
 
 2. **Check Tool Parameters**:
    - Refer to the tool's schema provided by the MCP server to identify required and optional parameters.
-   - If a \
-
-required parameter is missing, explicitly ask the user for it with a clear question, referencing the original request to maintain context (e.g., "You requested a ₹500 payment link. Please provide the email address to send the payment link.").
+   - If a required parameter is missing, explicitly ask the user for it with a clear question, referencing the original request to maintain context (e.g., "You requested a ₹500 payment link. Please provide the email address to send the payment link.").
    - Use provided parameters and any previous responses to fill optional fields (e.g., set `send_email` to true by default for `create_link`).
 
 3. **Call the Tool**:
@@ -84,30 +88,59 @@ config = {
 }
 
 # Initialize MCPClient
-client = MCPClient.from_dict(config)
+try:
+    client = MCPClient.from_dict(config)
+except Exception as e:
+    logger.exception("Failed to initialize MCPClient")
+    raise
 
 # Initialize Claude LLM
-llm = ChatAnthropic(
-    model="claude-3-5-sonnet-20241022",
-    api_key=ANTHROPIC_API_KEY,
-    temperature=0.7,
-    default_headers={"anthropic-beta": "tools-2024-05-16"},
-    model_kwargs={"system": SYSTEM_PROMPT},
-)
+try:
+    llm = ChatAnthropic(
+        model="claude-3-5-sonnet-20241022",
+        api_key=ANTHROPIC_API_KEY,
+        temperature=0.7,
+        default_headers={"anthropic-beta": "tools-2024-05-16"},
+        model_kwargs={"system": SYSTEM_PROMPT},
+    )
+except Exception as e:
+    logger.exception("Failed to initialize ChatAnthropic")
+    raise
 
 # Create MCPAgent
-agent = MCPAgent(
-    llm=llm,
-    client=client,
-    max_steps=30,
-    verbose=True,
-)
+try:
+    agent = MCPAgent(
+        llm=llm,
+        client=client,
+        max_steps=30,
+        verbose=True,
+    )
+except Exception as e:
+    logger.exception("Failed to initialize MCPAgent")
+    raise
 
 # In-memory session storage (use Redis for production)
 sessions = {}
 
 # Maximum attempts for missing parameters
 max_attempts = 3
+
+@app.route("/health", methods=["GET"])
+def health_check():
+    """Check if the app is running and dependencies are loaded."""
+    try:
+        return jsonify({
+            "status": "healthy",
+            "message": "Flask app is running",
+            "dependencies": {
+                "flask": "2.3.3",
+                "mcp_use": "loaded",
+                "anthropic": "loaded"
+            }
+        }), 200
+    except Exception as e:
+        logger.exception("Health check failed")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route("/process_request", methods=["POST"])
 async def process_request():
@@ -134,7 +167,7 @@ async def process_request():
         input_content = (request_json.get("original_prompt", session_data["original_prompt"]) +
                          "\n" + "\n".join(f"Provided: {inp}" for inp in previous_inputs) +
                          "\nProvided: " + request_json["user_input"])
-        logger.info(f"Session {session_id}: input_content: {input_content}")
+        logger.debug(f"Session {session_id}: input_content: {input_content}")
 
         try:
             # Run agent with timeout
@@ -179,7 +212,7 @@ async def process_request():
             logger.error(f"Session {session_id}: Agent execution timed out")
             return jsonify({"status": "error", "message": "Request timed out. Please try again.", "session_id": session_id}), 504
         except Exception as e:
-            logger.error(f"Session {session_id}: Agent execution failed: {str(e)}")
+            logger.exception(f"Session {session_id}: Agent execution failed: {str(e)}")
             if "missing required parameter" in str(e).lower():
                 missing_param = str(e).split("missing required parameter")[-1].strip()
                 session_data["attempts"] += 1
@@ -206,15 +239,18 @@ async def process_request():
             return jsonify({"status": "error", "message": f"Error: {str(e)}", "session_id": session_id}), 500
 
     except Exception as e:
-        logger.error(f"Session {session_id}: Request processing failed: {str(e)}")
-        return jsonify({"status": "error", "message": "Invalid request format"}), 400
+        logger.exception(f"Session {session_id}: Request processing failed: {str(e)}")
+        return jsonify({"status": "error", "message": f"Internal error: {str(e)}"}), 500
 
 @app.teardown_appcontext
 def cleanup_sessions(exception=None):
     """Close MCP client sessions on app shutdown."""
-    if client.sessions:
-        asyncio.run(client.close_all_sessions())
-        logger.info("Closed all MCP client sessions")
+    try:
+        if client.sessions:
+            asyncio.run(client.close_all_sessions())
+            logger.info("Closed all MCP client sessions")
+    except Exception as e:
+        logger.exception("Failed to close MCP client sessions")
 
 if __name__ == "__main__":
     app.run(debug=True)
