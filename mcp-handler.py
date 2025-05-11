@@ -9,32 +9,28 @@ from dotenv import load_dotenv
 from langchain_anthropic import ChatAnthropic
 from mcp_use import MCPAgent, MCPClient
 
-# Set up logging with maximum verbosity
+# Set up logging
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("app.log")
-    ]
+    handlers=[logging.StreamHandler(), logging.FileHandler("app.log")]
 )
 logger = logging.getLogger(__name__)
 logging.getLogger('werkzeug').setLevel(logging.DEBUG)
 logging.getLogger('mcp_use').setLevel(logging.DEBUG)
 logging.getLogger('langchain_anthropic').setLevel(logging.DEBUG)
 
-# Initialize Flask app
+# Flask app
 app = Flask(__name__)
 CORS(app)
 
-# Load environment variables
+# Load .env
 load_dotenv()
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 if not ANTHROPIC_API_KEY:
-    logger.error("ANTHROPIC_API_KEY not set in environment variables")
-    raise ValueError("ANTHROPIC_API_KEY is required")
+    raise ValueError("ANTHROPIC_API_KEY missing in environment variables")
 
-# System prompt with tools from local script
+# Prompt
 SYSTEM_PROMPT = """
 You are a Paytm MCP Assistant, an AI agent powered by the Paytm MCP Server, which enables secure access to Paytm's Payments and Business Payments APIs. Your role is to automate payment workflows using the available tools: `create_link`, `fetch_link`, and `fetch_transaction`. Follow these steps for every request:
 
@@ -82,7 +78,7 @@ You are a Paytm MCP Assistant, an AI agent powered by the Paytm MCP Server, whic
 Be concise, proactive, and user-friendly. If unsure about the task or parameters, ask clarifying questions to ensure accuracy, referencing the original request to maintain context.
 """
 
-# MCP server config
+# MCP config
 config = {
     "mcpServers": {
         "http": {
@@ -91,193 +87,83 @@ config = {
     }
 }
 
-# Initialize MCPClient
-try:
-    logger.info("Initializing MCPClient")
-    client = MCPClient.from_dict(config)
-    logger.info("MCPClient initialized successfully")
-except Exception as e:
-    logger.exception("Failed to initialize MCPClient")
-    raise
-
-# Initialize Claude LLM
-try:
-    logger.info("Initializing ChatAnthropic")
-    llm = ChatAnthropic(
-        model="claude-3-5-sonnet-20241022",
-        api_key=ANTHROPIC_API_KEY,
-        temperature=0.7,
-        default_headers={"anthropic-beta": "tools-2024-05-16"},
-        model_kwargs={"system": SYSTEM_PROMPT},
-    )
-    logger.info("ChatAnthropic initialized successfully")
-except Exception as e:
-    logger.exception("Failed to initialize ChatAnthropic")
-    raise
-
-# Create MCPAgent with preloaded tools
-try:
-    logger.info("Initializing MCPAgent")
-    agent = MCPAgent(
-        llm=llm,
-        client=client,
-        max_steps=30,
-        verbose=True,
-    )
-    # Preload tools and log available tools
-    async def preload_tools():
-        await agent.initialize()
-        # Log available tools
-        tools_response = await client.send_request('tools/list')
-        logger.info(f"MCP Server tools: {json.dumps(tools_response.get('result', {}).get('tools', []), indent=2)}")
-    asyncio.run(preload_tools())
-    logger.info("MCPAgent initialized successfully with preloaded tools")
-except Exception as e:
-    logger.exception("Failed to initialize MCPAgent or preload tools")
-    raise
-
-# In-memory session storage (use Redis for production)
+# Init client + Claude
+logger.info("Initializing MCPClient")
+client = MCPClient.from_dict(config)
+logger.info("Initializing ChatAnthropic")
+llm = ChatAnthropic(
+    model="claude-3-5-sonnet-20241022",
+    api_key=ANTHROPIC_API_KEY,
+    temperature=0.7,
+    default_headers={"anthropic-beta": "tools-2024-05-16"},
+    model_kwargs={"system": SYSTEM_PROMPT},
+)
+agent = MCPAgent(llm=llm, client=client, max_steps=30, verbose=True)
 sessions = {}
-
-# Maximum attempts for missing parameters
 max_attempts = 3
+
+# ✅ Delayed async initialization
+initialized = False
+@app.before_first_request
+def lazy_initialize():
+    global initialized
+    if not initialized:
+        logger.info("🔧 Lazy loading tools from MCP...")
+        asyncio.run(agent.initialize())
+        initialized = True
+        logger.info("✅ Tools loaded")
 
 @app.route("/health", methods=["GET"])
 def health_check():
-    """Check if the app is running and dependencies are loaded."""
-    try:
-        logger.info("Health check requested")
-        return jsonify({
-            "status": "healthy",
-            "message": "Flask app is running",
-            "dependencies": {
-                "flask": "2.3.3",
-                "mcp_use": "loaded",
-                "anthropic": "loaded"
-            }
-        }), 200
-    except Exception as e:
-        logger.exception("Health check failed")
-        return jsonify({"status": "error", "message": str(e)}), 500
+    return jsonify({"status": "healthy"}), 200
 
 @app.route("/process_request", methods=["POST"])
 def process_request():
-    """Handle user requests from chatbot."""
     session_id = None
     try:
-        logger.info("Processing request")
-        request_json = request.get_json()
-        if not request_json or "user_input" not in request_json:
-            logger.error("Invalid request: missing user_input")
-            return jsonify({"status": "error", "message": "Missing user_input in request"}), 400
+        data = request.get_json()
+        if not data or "user_input" not in data:
+            return jsonify({"error": "Missing user_input"}), 400
 
-        # Get or create session ID
-        session_id = request_json.get("session_id", str(uuid.uuid4()))
-        session_data = sessions.get(session_id, {
+        session_id = data.get("session_id", str(uuid.uuid4()))
+        session = sessions.get(session_id, {
             "conversation_history": [],
-            "original_prompt": request_json["user_input"],
-            "attempts": 0,
-            "initialized": True  # Agent is pre-initialized
+            "original_prompt": data["user_input"],
+            "attempts": 0
         })
 
-        # Append user input to conversation history
-        session_data["conversation_history"].append({"role": "user", "content": request_json["user_input"]})
+        session["conversation_history"].append({"role": "user", "content": data["user_input"]})
+        prev_inputs = [m["content"] for m in session["conversation_history"] if m["role"] == "user"][1:]
+        input_content = session["original_prompt"] + "\n" + "\n".join(f"Provided: {p}" for p in prev_inputs)
 
-        # Construct input_content with all previous user inputs
-        previous_inputs = [msg["content"] for msg in session_data["conversation_history"] if msg["role"] == "user"][1:]
-        input_content = (request_json.get("original_prompt", session_data["original_prompt"]) +
-                         "\n" + "\n".join(f"Provided: {inp}" for inp in previous_inputs) +
-                         "\nProvided: " + request_json["user_input"])
-        logger.debug(f"Session {session_id}: input_content: {input_content}")
-        logger.debug(f"Session {session_id}: session_data: {json.dumps(session_data, indent=2)}")
+        result = asyncio.run(asyncio.wait_for(agent.run(input_content, max_steps=30), timeout=45))
+        result_text = result[0]["text"] if isinstance(result, list) and "text" in result[0] else str(result)
 
-        try:
-            logger.debug(f"Session {session_id}: Starting MCPAgent.run")
-            result = asyncio.run(asyncio.wait_for(agent.run(input_content, max_steps=30), timeout=60.0))
-            logger.debug(f"Session {session_id}: Agent result: {json.dumps(result, indent=2)}")
-            result_text = result[0]["text"] if isinstance(result, list) and result and "text" in result[0] else str(result)
-            logger.info(f"Session {session_id}: Agent response: {result_text}")
+        if "please provide" in result_text.lower():
+            session["attempts"] += 1
+            if session["attempts"] >= max_attempts:
+                return jsonify({"status": "error", "message": "Too many attempts", "session_id": session_id})
+            sessions[session_id] = session
+            return jsonify({"status": "missing_parameter", "message": result_text, "session_id": session_id})
 
-            # Check for missing parameters
-            if "please provide" in result_text.lower() or "missing" in result_text.lower():
-                missing_param = result_text.split("please provide ")[-1].split(".")[0].strip() if "please provide" in result_text.lower() else "required parameter"
-                session_data["attempts"] += 1
-                session_data["conversation_history"].append({"role": "assistant", "content": result_text})
+        session["conversation_history"].append({"role": "assistant", "content": result_text})
+        sessions[session_id] = session
+        return jsonify({"status": "success", "message": result_text, "session_id": session_id})
 
-                if session_data["attempts"] >= max_attempts:
-                    logger.warning(f"Session {session_id}: Max attempts reached")
-                    sessions[session_id] = session_data
-                    return jsonify({
-                        "status": "error",
-                        "message": "Maximum attempts reached. Please start a new request with all required parameters.",
-                        "session_id": session_id
-                    })
-
-                sessions[session_id] = session_data
-                return jsonify({
-                    "status": "missing_parameter",
-                    "message": result_text,
-                    "missing_param": missing_param,
-                    "session_id": session_id,
-                    "original_prompt": session_data["original_prompt"]
-                })
-
-            # Success response
-            session_data["conversation_history"].append({"role": "assistant", "content": result_text})
-            sessions[session_id] = session_data
-            return jsonify({
-                "status": "success",
-                "message": result_text,
-                "session_id": session_id
-            })
-
-        except asyncio.TimeoutError:
-            logger.error(f"Session {session_id}: Agent execution timed out")
-            return jsonify({"status": "error", "message": "Request timed out. Please try again.", "session_id": session_id}), 504
-        except TypeError as e:
-            logger.exception(f"Session {session_id}: Pickling error during agent execution: {str(e)}")
-            return jsonify({"status": "error", "message": f"Pickling error: {str(e)}. Please try again or contact support.", "session_id": session_id}), 500
-        except Exception as e:
-            logger.exception(f"Session {session_id}: Agent execution failed: {str(e)}")
-            error_str = str(e).lower()
-            if any(keyword in error_str for keyword in ["missing required parameter", "email", "link_id", "transaction_id"]):
-                missing_param = "email" if "email" in error_str else "link_id" if "link_id" in error_str else "transaction_id"
-                session_data["attempts"] += 1
-                session_data["conversation_history"].append({"role": "assistant", "content": f"Missing required parameter: {missing_param}"})
-
-                if session_data["attempts"] >= max_attempts:
-                    logger.warning(f"Session {session_id}: Max attempts reached")
-                    sessions[session_id] = session_data
-                    return jsonify({
-                        "status": "error",
-                        "message": "Maximum attempts reached. Please start a new request with all required parameters.",
-                        "session_id": session_id
-                    })
-
-                sessions[session_id] = session_data
-                return jsonify({
-                    "status": "missing_parameter",
-                    "message": f"You requested: {session_data['original_prompt']}. Please provide the {missing_param}.",
-                    "missing_param": missing_param,
-                    "session_id": session_id,
-                    "original_prompt": session_data["original_prompt"]
-                })
-
-            return jsonify({"status": "error", "message": f"Agent error: {str(e)}", "session_id": session_id}), 500
-
+    except asyncio.TimeoutError:
+        return jsonify({"status": "error", "message": "Agent timeout"}), 504
     except Exception as e:
-        logger.exception(f"Session {session_id or 'unknown'}: Request processing failed: {str(e)}")
-        return jsonify({"status": "error", "message": f"Internal error: {str(e)}"}), 500
+        logger.exception("Unhandled exception")
+        return jsonify({"status": "error", "message": str(e), "session_id": session_id}), 500
 
 @app.teardown_appcontext
-def cleanup_sessions(exception=None):
-    """Close MCP client sessions on app shutdown."""
+def shutdown(exception=None):
     try:
         if client.sessions:
             asyncio.run(client.close_all_sessions())
-            logger.info("Closed all MCP client sessions")
     except Exception as e:
-        logger.exception("Failed to close MCP client sessions")
+        logger.exception("Error closing sessions")
 
 if __name__ == "__main__":
     app.run(debug=True)
+
