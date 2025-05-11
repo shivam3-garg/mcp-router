@@ -16,6 +16,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 logging.getLogger('werkzeug').setLevel(logging.DEBUG)
+logging.getLogger('mcp_use').setLevel(logging.DEBUG)
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -43,7 +44,7 @@ You are a Paytm MCP Assistant, an AI agent powered by the Paytm MCP Server, whic
 2. **Check Tool Parameters**:
    - Refer to the tool's schema provided by the MCP server to identify required and optional parameters.
    - If a required parameter is missing, explicitly ask the user for it with a clear question, referencing the original request to maintain context (e.g., "You requested a ₹500 payment link. Please provide the email address to send the payment link.").
-   - Use provided parameters and any previous responses to fill optional fields (e.g., set `send_email` to true by default for `create_link`).
+   - Use provided parameters and any previous responses to fill optional fields (e.g., set `create_link` to true by default for `create_link`).
 
 3. **Call the Tool**:
    - Invoke the selected tool with the extracted or user-provided parameters.
@@ -143,6 +144,7 @@ def health_check():
 @app.route("/process_request", methods=["POST"])
 async def process_request():
     """Handle user requests from chatbot."""
+    session_id = None
     try:
         request_json = request.get_json()
         if not request_json or "user_input" not in request_json:
@@ -154,7 +156,8 @@ async def process_request():
         session_data = sessions.get(session_id, {
             "conversation_history": [],
             "original_prompt": request_json["user_input"],
-            "attempts": 0
+            "attempts": 0,
+            "initialized": False
         })
 
         # Append user input to conversation history
@@ -166,9 +169,16 @@ async def process_request():
                          "\n" + "\n".join(f"Provided: {inp}" for inp in previous_inputs) +
                          "\nProvided: " + request_json["user_input"])
         logger.debug(f"Session {session_id}: input_content: {input_content}")
+        logger.debug(f"Session {session_id}: session_data: {json.dumps(session_data, indent=2)}")
 
         try:
-            # Run agent with increased timeout
+            # Ensure MCPClient is initialized only once
+            if not session_data.get("initialized"):
+                logger.debug(f"Session {session_id}: Initializing MCPClient session")
+                # MCPClient initialization is handled at startup, so just mark as initialized
+                session_data["initialized"] = True
+
+            logger.debug(f"Session {session_id}: Running MCPAgent with input: {input_content}")
             result = await asyncio.wait_for(agent.run(input_content, max_steps=30), timeout=60.0)
             logger.debug(f"Session {session_id}: Agent result: {json.dumps(result, indent=2)}")
             result_text = result[0]["text"] if isinstance(result, list) and result and "text" in result[0] else str(result)
@@ -212,10 +222,10 @@ async def process_request():
             return jsonify({"status": "error", "message": "Request timed out. Please try again.", "session_id": session_id}), 504
         except Exception as e:
             logger.exception(f"Session {session_id}: Agent execution failed: {str(e)}")
-            # Check if the error is related to missing parameters
             error_str = str(e).lower()
+            # Handle MCP-specific errors
             if any(keyword in error_str for keyword in ["missing required parameter", "recipient_name", "purpose", "customer_email", "customer_mobile"]):
-                missing_param = "recipient_name"  # Default to first required field
+                missing_param = "recipient_name"
                 if "customer_email" in error_str or "customer_mobile" in error_str:
                     missing_param = "customer_email or customer_mobile"
                 elif "purpose" in error_str:
@@ -244,7 +254,7 @@ async def process_request():
             return jsonify({"status": "error", "message": f"Agent error: {str(e)}", "session_id": session_id}), 500
 
     except Exception as e:
-        logger.exception(f"Session {session_id}: Request processing failed: {str(e)}")
+        logger.exception(f"Session {session_id or 'unknown'}: Request processing failed: {str(e)}")
         return jsonify({"status": "error", "message": f"Internal error: {str(e)}"}), 500
 
 @app.teardown_appcontext
