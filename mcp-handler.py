@@ -11,17 +11,15 @@ from mcp_use import MCPAgent, MCPClient
 
 # Set up logging with maximum verbosity
 logging.basicConfig(
-    level=logging.DEBUG,  # Changed from INFO to DEBUG
+    level=logging.DEBUG,
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
-
-# Ensure Flask/Werkzeug logs are captured
 logging.getLogger('werkzeug').setLevel(logging.DEBUG)
 
 # Initialize Flask app
 app = Flask(__name__)
-CORS(app)  # Enable CORS for chatbot access
+CORS(app)
 
 # Load environment variables
 load_dotenv()
@@ -163,15 +161,16 @@ async def process_request():
         session_data["conversation_history"].append({"role": "user", "content": request_json["user_input"]})
 
         # Construct input_content with all previous user inputs
-        previous_inputs = [msg["content"] for msg in session_data["conversation_history"] if msg["role"] == "user"][1:]  # Skip original prompt
+        previous_inputs = [msg["content"] for msg in session_data["conversation_history"] if msg["role"] == "user"][1:]
         input_content = (request_json.get("original_prompt", session_data["original_prompt"]) +
                          "\n" + "\n".join(f"Provided: {inp}" for inp in previous_inputs) +
                          "\nProvided: " + request_json["user_input"])
         logger.debug(f"Session {session_id}: input_content: {input_content}")
 
         try:
-            # Run agent with timeout
-            result = await asyncio.wait_for(agent.run(input_content, max_steps=30), timeout=30.0)
+            # Run agent with increased timeout
+            result = await asyncio.wait_for(agent.run(input_content, max_steps=30), timeout=60.0)
+            logger.debug(f"Session {session_id}: Agent result: {json.dumps(result, indent=2)}")
             result_text = result[0]["text"] if isinstance(result, list) and result and "text" in result[0] else str(result)
             logger.info(f"Session {session_id}: Agent response: {result_text}")
 
@@ -213,8 +212,14 @@ async def process_request():
             return jsonify({"status": "error", "message": "Request timed out. Please try again.", "session_id": session_id}), 504
         except Exception as e:
             logger.exception(f"Session {session_id}: Agent execution failed: {str(e)}")
-            if "missing required parameter" in str(e).lower():
-                missing_param = str(e).split("missing required parameter")[-1].strip()
+            # Check if the error is related to missing parameters
+            error_str = str(e).lower()
+            if any(keyword in error_str for keyword in ["missing required parameter", "recipient_name", "purpose", "customer_email", "customer_mobile"]):
+                missing_param = "recipient_name"  # Default to first required field
+                if "customer_email" in error_str or "customer_mobile" in error_str:
+                    missing_param = "customer_email or customer_mobile"
+                elif "purpose" in error_str:
+                    missing_param = "purpose"
                 session_data["attempts"] += 1
                 session_data["conversation_history"].append({"role": "assistant", "content": f"Missing required parameter: {missing_param}"})
 
@@ -236,7 +241,7 @@ async def process_request():
                     "original_prompt": session_data["original_prompt"]
                 })
 
-            return jsonify({"status": "error", "message": f"Error: {str(e)}", "session_id": session_id}), 500
+            return jsonify({"status": "error", "message": f"Agent error: {str(e)}", "session_id": session_id}), 500
 
     except Exception as e:
         logger.exception(f"Session {session_id}: Request processing failed: {str(e)}")
