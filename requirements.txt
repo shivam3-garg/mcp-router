@@ -1,0 +1,6 @@
+Flask==2.3.3
+flask-cors==4.0.1
+python-dotenv==1.0.1
+langchain-anthropic==0.1.23 
+mcp-use==0.1.0 
+gunicorn==22.0.0
