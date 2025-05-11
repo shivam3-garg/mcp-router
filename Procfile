@@ -1,1 +1,1 @@
-web: gunicorn mcm-handler:app
+web: gunicorn mcp-handler:app
