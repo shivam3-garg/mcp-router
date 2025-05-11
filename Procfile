@@ -1,1 +1,1 @@
-web: gunicorn mcp-handler:app
+web: gunicorn mcp-handler:app --log-level debug --access-logfile - --error-logfile - --timeout 120

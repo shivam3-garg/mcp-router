@@ -12,11 +12,16 @@ from mcp_use import MCPAgent, MCPClient
 # Set up logging with maximum verbosity
 logging.basicConfig(
     level=logging.DEBUG,
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("app.log")  # Save logs to file for Render
+    ]
 )
 logger = logging.getLogger(__name__)
 logging.getLogger('werkzeug').setLevel(logging.DEBUG)
 logging.getLogger('mcp_use').setLevel(logging.DEBUG)
+logging.getLogger('langchain_anthropic').setLevel(logging.DEBUG)
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -29,7 +34,7 @@ if not ANTHROPIC_API_KEY:
     logger.error("ANTHROPIC_API_KEY not set in environment variables")
     raise ValueError("ANTHROPIC_API_KEY is required")
 
-# System prompt (unchanged)
+# System prompt with correct tool names
 SYSTEM_PROMPT = """
 You are a Paytm MCP Assistant, an AI agent powered by the Paytm MCP Server, which enables secure access to Paytm's Payments and Business Payments APIs. Your role is to automate payment workflows using the available tools: `create_link`, `fetch_link`, and `fetch_transaction`. Follow these steps for every request:
 
@@ -37,44 +42,47 @@ You are a Paytm MCP Assistant, an AI agent powered by the Paytm MCP Server, whic
    - Analyze the user's prompt to identify the intended task (e.g., create a payment link, fetch link details, or check transaction status).
    - Determine which tool to use based on the task:
      - `create_link`: To create a new payment link (e.g., "Create a ₹500 payment link").
-     - `fetch_link`: To retrieve details of an existing payment link (e.g., "Get details for link ID XYZ").
-     - `fetch_transaction`: To fetch transaction details for a link or transaction ID (e.g., "Check transaction status for link ID XYZ").
-   - Extract all relevant parameters from the prompt (e.g., amount, email, link ID, transaction ID).
+     - `fetch_link`: To retrieve details of all payment links (e.g., "List all payment links").
+     - `fetch_transaction`: To fetch transaction details for a specific link (e.g., "Check transactions for link ID XYZ").
+   - Extract all relevant parameters from the prompt (e.g., amount, recipient_name, purpose, customer_email, customer_mobile, link_id).
 
 2. **Check Tool Parameters**:
    - Refer to the tool's schema provided by the MCP server to identify required and optional parameters.
-   - If a required parameter is missing, explicitly ask the user for it with a clear question, referencing the original request to maintain context (e.g., "You requested a ₹500 payment link. Please provide the email address to send the payment link.").
-   - Use provided parameters and any previous responses to fill optional fields (e.g., set `create_link` to true by default for `create_link`).
+   - For `create_link`, required parameters are:
+     - recipient_name (str): Name of the recipient.
+     - purpose (str): Description or reason for the payment.
+     - At least one of customer_email (str) or customer_mobile (str).
+   - If a required parameter is missing, explicitly ask the user for it with a clear question, referencing the original request (e.g., "You requested a ₹500 payment link. Please provide the recipient name.").
+   - Use provided parameters to fill optional fields (e.g., amount).
 
 3. **Call the Tool**:
    - Invoke the selected tool with the extracted or user-provided parameters.
-   - Only include parameters that the tool's schema accepts. Map user-provided terms (e.g., "recipient name") to appropriate fields (e.g., `description`) or omit if not supported.
+   - Only include parameters that the tool's schema accepts.
 
 4. **Validate the Output**:
-   - For `create_link`: Ensure the returned URL starts with "paytm.me/". Confirm the email was sent if requested.
-   - For `fetch_link`: Verify the response contains valid link details (e.g., link ID, status).
-   - For `fetch_transaction`: Confirm the response includes transaction details (e.g., status, amount).
+   - For `create_link`: Ensure the returned URL starts with "paytm.me/".
+   - For `fetch_link`: Verify the response contains a list of link details.
+   - For `fetch_transaction`: Confirm the response includes transaction details.
    - If the output is invalid, report the issue and retry with corrected parameters if possible.
 
 5. **Handle Missing Parameters**:
-   - If a tool call fails due to missing required parameters, ask the user for the missing information, referencing the original request (e.g., "You requested to check transactions for a link. Please provide the link ID.").
-   - Incorporate the new input and previous context to retry the tool call, ensuring all previously provided parameters are retained.
+   - If a tool call fails due to missing required parameters, ask the user for the missing information, referencing the original request (e.g., "You requested a ₹500 payment link. Please provide the customer email or mobile number.").
+   - Incorporate the new input and previous context to retry the tool call.
 
 6. **Provide a Polished Response**:
-   - Summarize the action taken in a structured format using bullet points or numbered lists.
-   - Example response format:
+   - Summarize the action taken in a structured format:
      - Action: Created payment link
-     - Details: Amount: ₹{amount}, Link: {url}, Email: {email}
+     - Details: Amount: ₹{amount}, Link: {url}, Recipient: {recipient_name}
      - Next Steps: {next_steps}
-   - If an error occurs, explain the issue clearly and suggest next steps (e.g., "Invalid link ID. Please provide a valid ID or create a new link.").
-   - If requesting user input, format the question clearly:
+   - If requesting user input:
      - Question: {question referencing original request}
+   - If an error occurs, explain clearly (e.g., "Invalid link ID. Please provide a valid ID.").
 
 7. **Maintain Context**:
-   - Use previous responses and user inputs to inform subsequent tool calls, ensuring continuity in the workflow.
-   - When asking for missing parameters, restate the original request to confirm intent (e.g., "You requested a ₹500 payment link for lunch. Please provide the email address.").
+   - Use previous responses and user inputs to inform subsequent tool calls.
+   - Restate the original request when asking for missing parameters.
 
-Be concise, proactive, and user-friendly. If unsure about the task or parameters, ask clarifying questions to ensure accuracy, referencing the original request to maintain context.
+Be concise, proactive, and user-friendly. If unsure, ask clarifying questions, referencing the original request.
 """
 
 # MCP server config
@@ -88,13 +96,16 @@ config = {
 
 # Initialize MCPClient
 try:
+    logger.info("Initializing MCPClient")
     client = MCPClient.from_dict(config)
+    logger.info("MCPClient initialized successfully")
 except Exception as e:
     logger.exception("Failed to initialize MCPClient")
     raise
 
 # Initialize Claude LLM
 try:
+    logger.info("Initializing ChatAnthropic")
     llm = ChatAnthropic(
         model="claude-3-5-sonnet-20241022",
         api_key=ANTHROPIC_API_KEY,
@@ -102,18 +113,21 @@ try:
         default_headers={"anthropic-beta": "tools-2024-05-16"},
         model_kwargs={"system": SYSTEM_PROMPT},
     )
+    logger.info("ChatAnthropic initialized successfully")
 except Exception as e:
     logger.exception("Failed to initialize ChatAnthropic")
     raise
 
 # Create MCPAgent
 try:
+    logger.info("Initializing MCPAgent")
     agent = MCPAgent(
         llm=llm,
         client=client,
         max_steps=30,
         verbose=True,
     )
+    logger.info("MCPAgent initialized successfully")
 except Exception as e:
     logger.exception("Failed to initialize MCPAgent")
     raise
@@ -128,6 +142,7 @@ max_attempts = 3
 def health_check():
     """Check if the app is running and dependencies are loaded."""
     try:
+        logger.info("Health check requested")
         return jsonify({
             "status": "healthy",
             "message": "Flask app is running",
@@ -142,10 +157,11 @@ def health_check():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route("/process_request", methods=["POST"])
-async def process_request():
+def process_request():
     """Handle user requests from chatbot."""
     session_id = None
     try:
+        logger.info("Processing request")
         request_json = request.get_json()
         if not request_json or "user_input" not in request_json:
             logger.error("Invalid request: missing user_input")
@@ -175,11 +191,10 @@ async def process_request():
             # Ensure MCPClient is initialized only once
             if not session_data.get("initialized"):
                 logger.debug(f"Session {session_id}: Initializing MCPClient session")
-                # MCPClient initialization is handled at startup, so just mark as initialized
                 session_data["initialized"] = True
 
-            logger.debug(f"Session {session_id}: Running MCPAgent with input: {input_content}")
-            result = await asyncio.wait_for(agent.run(input_content, max_steps=30), timeout=60.0)
+            logger.debug(f"Session {session_id}: Starting MCPAgent.run")
+            result = asyncio.run(asyncio.wait_for(agent.run(input_content, max_steps=30), timeout=60.0))
             logger.debug(f"Session {session_id}: Agent result: {json.dumps(result, indent=2)}")
             result_text = result[0]["text"] if isinstance(result, list) and result and "text" in result[0] else str(result)
             logger.info(f"Session {session_id}: Agent response: {result_text}")
@@ -223,7 +238,6 @@ async def process_request():
         except Exception as e:
             logger.exception(f"Session {session_id}: Agent execution failed: {str(e)}")
             error_str = str(e).lower()
-            # Handle MCP-specific errors
             if any(keyword in error_str for keyword in ["missing required parameter", "recipient_name", "purpose", "customer_email", "customer_mobile"]):
                 missing_param = "recipient_name"
                 if "customer_email" in error_str or "customer_mobile" in error_str:
