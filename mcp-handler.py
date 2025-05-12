@@ -11,6 +11,8 @@ from langchain_anthropic import ChatAnthropic
 from mcp_use import MCPAgent, MCPClient
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+import anyio
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # Set up logging with verbosity and file output
 logging.basicConfig(
@@ -36,7 +38,7 @@ if not ANTHROPIC_API_KEY:
     logger.error("ANTHROPIC_API_KEY not set in environment variables")
     raise ValueError("ANTHROPIC_API_KEY is required")
 
-# System prompt
+# System prompt (same as local code)
 SYSTEM_PROMPT = """
 You are a Paytm MCP Assistant, an AI agent powered by the Paytm MCP Server, which enables secure access to Paytm's Payments and Business Payments APIs. Your role is to automate payment workflows using the available tools: `create_link`, `fetch_link`, and `fetch_transaction`. Follow these steps for every request:
 
@@ -44,8 +46,8 @@ You are a Paytm MCP Assistant, an AI agent powered by the Paytm MCP Server, whic
    - Analyze the user's prompt to identify the intended task (e.g., create a payment link, fetch link details, or check transaction status).
    - Determine which tool to use based on the task:
      - `create_link`: To create a new payment link (e.g., "Create a ₹500 payment link").
-     - `fetch_link`: To retrieve details of an existing payment link (e.g., "Get details for link ID xyz").
-     - `fetch_transaction`: To fetch transaction details for a link or transaction ID (e.g., "Check transaction status for link ID xyz").
+     - `fetch_link`: To retrieve details of an existing payment link (e.g., "Get details for link ID XYZ").
+     - `fetch_transaction`: To fetch transaction details for a link or transaction ID (e.g., "Check transaction status for link ID XYZ").
    - Extract all relevant parameters from the prompt (e.g., amount, email, link ID, transaction ID).
 
 2. **Check Tool Parameters**:
@@ -152,45 +154,26 @@ except Exception as e:
     logger.exception("Failed to initialize MCPAgent")
     raise
 
-def clean_schema(schema: dict) -> dict:
-    """Recursively clean a schema to remove unpicklable objects like Futures."""
-    if isinstance(schema, dict):
-        return {k: clean_schema(v) for k, v in schema.items()}
-    elif isinstance(schema, list):
-        return [clean_schema(item) for item in schema]
-    elif isinstance(schema, (str, int, float, bool, type(None))):
-        return schema
-    else:
-        # Replace unpicklable objects (e.g., Futures) with None or a safe default
-        logger.warning(f"Replacing unpicklable object of type {type(schema)} with None")
-        return None
+# Retry decorator for MCP server connections
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type(Exception),
+    before_sleep=lambda retry_state: logger.info(f"Retrying MCP connection (attempt {retry_state.attempt_number})...")
+)
+async def initialize_agent_with_retry(agent):
+    """Initialize MCPAgent with retry logic."""
+    try:
+        await agent.initialize()
+    except Exception as e:
+        logger.error(f"Failed to initialize MCPAgent: {str(e)}")
+        raise
 
 # Lifespan for startup/shutdown
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Preload tools
-    async def preload_tools():
-        try:
-            await agent.initialize()
-            tools_response = await client.send_request('tools/list')
-            tools = tools_response.get('result', {}).get('tools', [])
-            logger.info(f"MCP Server tools: {json.dumps(tools, indent=2)}")
-            # Pre-create LangChain tools to catch pickling issues early
-            for tool in tools:
-                try:
-                    cleaned_schema = clean_schema(tool.get('schema', {}))
-                    tool['schema'] = cleaned_schema
-                    # Simulate tool conversion (mimics LangChainAdapter)
-                    # This ensures tools are created without Futures
-                    await agent.adapter.create_tools(client)
-                except Exception as e:
-                    logger.error(f"Failed to process tool {tool.get('name')}: {str(e)}")
-            logger.info("Successfully preloaded and validated tools")
-        except Exception as e:
-            logger.error(f"Failed to preload tools: {str(e)}")
-    
-    await preload_tools()
-    logger.info("MCPAgent initialized successfully with preloaded tools")
+    # Startup: No preloading of tools to avoid lingering Futures
+    logger.info("Starting FastAPI app without preloading tools")
     
     yield
     
@@ -205,11 +188,19 @@ app.lifespan = lifespan
 async def health_check():
     """Health check endpoint."""
     logger.info("Health check requested")
+    mcp_status = "unknown"
+    session = None
     try:
-        tools_response = await client.send_request('tools/list')
+        session = await client.create_session("health_check", auto_initialize=True)
+        tools_response = await session.send('tools/list')
         mcp_status = "healthy" if tools_response.get('result', {}).get('tools') else "unavailable"
     except Exception as e:
         mcp_status = f"error: {str(e)}"
+        logger.error(f"MCP server health check failed: {str(e)}")
+    finally:
+        if session:
+            await session.close()
+            logger.info("Closed health check session")
     return {"status": "healthy", "message": "FastAPI app is running", "mcp_status": mcp_status}
 
 @app.post("/chat", response_model=ChatResponse)
@@ -265,30 +256,23 @@ async def chat(request: ChatRequest):
             except asyncio.TimeoutError:
                 logger.error(f"Session {session_id}: Agent execution timed out")
                 raise HTTPException(status_code=504, detail="Request timed out. Please try again.")
-            except TypeError as e:
-                logger.exception(f"Session {session_id}: Pickling error: {str(e)}")
-                # Attempt to reinitialize agent with cleaned tools
-                try:
-                    await agent.initialize()
-                    tools_response = await client.send_request('tools/list')
-                    tools = tools_response.get('result', {}).get('tools', [])
-                    for tool in tools:
-                        tool['schema'] = clean_schema(tool.get('schema', {}))
-                    await agent.adapter.create_tools(client)
-                    logger.info(f"Session {session_id}: Reinitialized agent after pickling error")
-                    session["attempts"] += 1
-                    continue
-                except Exception as reinitialize_error:
-                    logger.error(f"Session {session_id}: Reinitialization failed: {str(reinitialize_error)}")
-                    raise HTTPException(status_code=500, detail=f"Pickling error: {str(e)}. Reinitialization failed: {str(reinitialize_error)}")
             except Exception as e:
                 logger.exception(f"Session {session_id}: Agent execution failed: {str(e)}")
                 error_str = str(e).lower()
+                # Check if the error is due to MCP server unavailability
+                if "502 bad gateway" in error_str.lower():
+                    response_text = "Unable to connect to the MCP server. Please try again later or contact support."
+                    session["conversation_history"].append({"role": "assistant", "content": response_text})
+                    sessions[session_id] = session
+                    return ChatResponse(response=response_text, status="error", session_id=session_id)
+
+                # Attempt to fetch tool schema to identify missing parameters
+                missing_param = None
+                schema_session = None
                 try:
-                    # Fetch tool schema to identify missing parameters dynamically
-                    tools_response = await client.send_request('tools/list')
+                    schema_session = await client.create_session(f"schema-{session_id}", auto_initialize=True)
+                    tools_response = await schema_session.send('tools/list')
                     tools = tools_response.get('result', {}).get('tools', [])
-                    missing_param = None
                     for tool in tools:
                         schema = tool.get('schema', {})
                         required = schema.get('required', [])
@@ -298,10 +282,16 @@ async def chat(request: ChatRequest):
                                 break
                         if missing_param:
                             break
-                    missing_param = missing_param or ("email" if "email" in error_str else "link_id" if "link_id" in error_str else "transaction_id")
                 except Exception as schema_error:
                     logger.error(f"Failed to fetch tool schema: {str(schema_error)}")
-                    missing_param = "required parameter"
+                    # Fallback to static parameters
+                    static_params = ["email", "description"]
+                    missing_param = static_params[session["attempts"]] if session["attempts"] < len(static_params) else "required parameter"
+                finally:
+                    if schema_session:
+                        await schema_session.close()
+                        logger.info(f"Closed schema session for {session_id}")
+
                 response_text = f"You requested: {session['original_prompt']}. Please provide the {missing_param}."
                 session["attempts"] += 1
                 session["conversation_history"].append({"role": "assistant", "content": response_text})
