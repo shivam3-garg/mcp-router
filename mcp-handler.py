@@ -111,7 +111,7 @@ class ChatResponse(BaseModel):
 # In-memory session storage with attempt tracking
 sessions: Dict[str, Dict] = {}
 
-# MCPClient and MCPAgent
+# MCPClient configuration
 config = {
     "mcpServers": {
         "http": {
@@ -119,40 +119,6 @@ config = {
         }
     }
 }
-
-try:
-    logger.info("Initializing MCPClient")
-    client = MCPClient.from_dict(config)
-    logger.info("MCPClient initialized successfully")
-except Exception as e:
-    logger.exception("Failed to initialize MCPClient")
-    raise
-
-try:
-    logger.info("Initializing ChatAnthropic")
-    llm = ChatAnthropic(
-        model="claude-3-5-sonnet-20241022",
-        api_key=ANTHROPIC_API_KEY,
-        temperature=0.7,
-        default_headers={"anthropic-beta": "tools-2024-05-16"},
-        model_kwargs={"system": SYSTEM_PROMPT},
-    )
-    logger.info("ChatAnthropic initialized successfully")
-except Exception as e:
-    logger.exception("Failed to initialize ChatAnthropic")
-    raise
-
-try:
-    logger.info("Initializing MCPAgent")
-    agent = MCPAgent(
-        llm=llm,
-        client=client,
-        max_steps=30,
-        verbose=True,
-    )
-except Exception as e:
-    logger.exception("Failed to initialize MCPAgent")
-    raise
 
 # Retry decorator for MCP server connections
 @retry(
@@ -172,15 +138,9 @@ async def initialize_agent_with_retry(agent):
 # Lifespan for startup/shutdown
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: No preloading of tools to avoid lingering Futures
-    logger.info("Starting FastAPI app without preloading tools")
-    
+    logger.info("Starting FastAPI app")
     yield
-    
-    # Shutdown: Clean up
-    if client.sessions:
-        await client.close_all_sessions()
-        logger.info("Closed all MCP client sessions")
+    logger.info("Shutting down FastAPI app")
 
 app.lifespan = lifespan
 
@@ -189,9 +149,13 @@ async def health_check():
     """Health check endpoint."""
     logger.info("Health check requested")
     mcp_status = "unknown"
+    client = None
     session = None
     try:
-        session = await client.create_session("health_check", auto_initialize=True)
+        # Create a new MCPClient for the health check
+        client = MCPClient.from_dict(config)
+        # Use a generic server ID that matches the config
+        session = await client.create_session("http", auto_initialize=True)
         tools_response = await session.send('tools/list')
         mcp_status = "healthy" if tools_response.get('result', {}).get('tools') else "unavailable"
     except Exception as e:
@@ -201,12 +165,31 @@ async def health_check():
         if session:
             await session.close()
             logger.info("Closed health check session")
+        if client:
+            await client.close_all_sessions()
+            logger.info("Closed MCP client for health check")
     return {"status": "healthy", "message": "FastAPI app is running", "mcp_status": mcp_status}
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """Handle chatbot POST requests."""
     logger.info(f"Received request: session_id={request.session_id}, message={request.message}")
+
+    # Create a new MCPClient and MCPAgent for each request
+    client = MCPClient.from_dict(config)
+    llm = ChatAnthropic(
+        model="claude-3-5-sonnet-20241022",
+        api_key=ANTHROPIC_API_KEY,
+        temperature=0.7,
+        default_headers={"anthropic-beta": "tools-2024-05-16"},
+        model_kwargs={"system": SYSTEM_PROMPT},
+    )
+    agent = MCPAgent(
+        llm=llm,
+        client=client,
+        max_steps=30,
+        verbose=True,
+    )
 
     try:
         # Generate session_id if not provided
@@ -257,7 +240,7 @@ async def chat(request: ChatRequest):
                 logger.error(f"Session {session_id}: Agent execution timed out")
                 raise HTTPException(status_code=504, detail="Request timed out. Please try again.")
             except Exception as e:
-                logger.exception(f"Session {session_id}: Agent execution failed: {str(e)}")
+                logger.error(f"Session {session_id}: Agent execution failed: {str(e)}")
                 error_str = str(e).lower()
                 # Check if the error is due to MCP server unavailability
                 if "502 bad gateway" in error_str.lower():
@@ -266,31 +249,9 @@ async def chat(request: ChatRequest):
                     sessions[session_id] = session
                     return ChatResponse(response=response_text, status="error", session_id=session_id)
 
-                # Attempt to fetch tool schema to identify missing parameters
-                missing_param = None
-                schema_session = None
-                try:
-                    schema_session = await client.create_session(f"schema-{session_id}", auto_initialize=True)
-                    tools_response = await schema_session.send('tools/list')
-                    tools = tools_response.get('result', {}).get('tools', [])
-                    for tool in tools:
-                        schema = tool.get('schema', {})
-                        required = schema.get('required', [])
-                        for param in required:
-                            if param.lower() in error_str:
-                                missing_param = param
-                                break
-                        if missing_param:
-                            break
-                except Exception as schema_error:
-                    logger.error(f"Failed to fetch tool schema: {str(schema_error)}")
-                    # Fallback to static parameters
-                    static_params = ["email", "description"]
-                    missing_param = static_params[session["attempts"]] if session["attempts"] < len(static_params) else "required parameter"
-                finally:
-                    if schema_session:
-                        await schema_session.close()
-                        logger.info(f"Closed schema session for {session_id}")
+                # Fallback to static parameters for missing parameter detection
+                static_params = ["email", "description", "recipient_name", "customer_mobile"]
+                missing_param = static_params[session["attempts"]] if session["attempts"] < len(static_params) else "required parameter"
 
                 response_text = f"You requested: {session['original_prompt']}. Please provide the {missing_param}."
                 session["attempts"] += 1
@@ -303,9 +264,10 @@ async def chat(request: ChatRequest):
         logger.error(f"Session {session_id}: {error_msg}")
         raise HTTPException(status_code=400, detail=error_msg)
 
-    except Exception as e:
-        logger.exception(f"Session {session_id}: Request processing failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+    finally:
+        # Clean up: Close all sessions and the client
+        await client.close_all_sessions()
+        logger.info(f"Session {session_id}: Closed all MCP client sessions after request")
 
 @app.on_event("startup")
 async def cleanup_sessions():
