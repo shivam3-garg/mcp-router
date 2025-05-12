@@ -1,36 +1,42 @@
 import asyncio
-import json
-import uuid
 import os
+import json
 import logging
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+from typing import Dict, List
+import uuid
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 from dotenv import load_dotenv
 from langchain_anthropic import ChatAnthropic
 from mcp_use import MCPAgent, MCPClient
+from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 
-# Set up logging
+# Set up logging with verbosity and file output
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-    handlers=[logging.StreamHandler(), logging.FileHandler("app.log")]
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("/tmp/app.log")  # Use /tmp for Render
+    ]
 )
 logger = logging.getLogger(__name__)
-logging.getLogger('werkzeug').setLevel(logging.DEBUG)
+logging.getLogger('uvicorn').setLevel(logging.DEBUG)
 logging.getLogger('mcp_use').setLevel(logging.DEBUG)
 logging.getLogger('langchain_anthropic').setLevel(logging.DEBUG)
 
-# Flask app
-app = Flask(__name__)
-CORS(app)
-
-# Load .env
+# Load environment variables
 load_dotenv()
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-if not ANTHROPIC_API_KEY:
-    raise ValueError("ANTHROPIC_API_KEY missing in environment variables")
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "https://payment-ol-mcp.onrender.com/sse")
+AGENT_TIMEOUT = int(os.getenv("AGENT_TIMEOUT", "60"))  # Configurable timeout
 
-# Prompt
+if not ANTHROPIC_API_KEY:
+    logger.error("ANTHROPIC_API_KEY not set in environment variables")
+    raise ValueError("ANTHROPIC_API_KEY is required")
+
+# System prompt (from original local code)
 SYSTEM_PROMPT = """
 You are a Paytm MCP Assistant, an AI agent powered by the Paytm MCP Server, which enables secure access to Paytm's Payments and Business Payments APIs. Your role is to automate payment workflows using the available tools: `create_link`, `fetch_link`, and `fetch_transaction`. Follow these steps for every request:
 
@@ -38,8 +44,8 @@ You are a Paytm MCP Assistant, an AI agent powered by the Paytm MCP Server, whic
    - Analyze the user's prompt to identify the intended task (e.g., create a payment link, fetch link details, or check transaction status).
    - Determine which tool to use based on the task:
      - `create_link`: To create a new payment link (e.g., "Create a ₹500 payment link").
-     - `fetch_link`: To retrieve details of an existing payment link (e.g., "Get details for link ID XYZ").
-     - `fetch_transaction`: To fetch transaction details for a link or transaction ID (e.g., "Check transaction status for link ID XYZ").
+     - `fetch_link`: To retrieve details of an existing payment link (e.g., "Get details for link ID xyz").
+     - `fetch_transaction`: To fetch transaction details for a link or transaction ID (e.g., "Check transaction status for link ID xyz").
    - Extract all relevant parameters from the prompt (e.g., amount, email, link ID, transaction ID).
 
 2. **Check Tool Parameters**:
@@ -78,92 +84,205 @@ You are a Paytm MCP Assistant, an AI agent powered by the Paytm MCP Server, whic
 Be concise, proactive, and user-friendly. If unsure about the task or parameters, ask clarifying questions to ensure accuracy, referencing the original request to maintain context.
 """
 
-# MCP config
+# FastAPI app
+app = FastAPI(title="Paytm MCP Chatbot API")
+
+# Enable CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[os.getenv("CHATBOT_ORIGIN", "*")],  # Restrict in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Pydantic models
+class ChatRequest(BaseModel):
+    message: str
+    session_id: str | None = None
+
+class ChatResponse(BaseModel):
+    response: str
+    status: str
+    session_id: str
+
+# In-memory session storage with attempt tracking
+sessions: Dict[str, Dict] = {}
+
+# MCPClient and MCPAgent
 config = {
     "mcpServers": {
         "http": {
-            "url": "https://payment-ol-mcp.onrender.com/sse"
+            "url": MCP_SERVER_URL
         }
     }
 }
 
-# Init client + Claude
-logger.info("Initializing MCPClient")
-client = MCPClient.from_dict(config)
-logger.info("Initializing ChatAnthropic")
-llm = ChatAnthropic(
-    model="claude-3-5-sonnet-20241022",
-    api_key=ANTHROPIC_API_KEY,
-    temperature=0.7,
-    default_headers={"anthropic-beta": "tools-2024-05-16"},
-    model_kwargs={"system": SYSTEM_PROMPT},
-)
-agent = MCPAgent(llm=llm, client=client, max_steps=30, verbose=True)
-sessions = {}
-max_attempts = 3
+try:
+    logger.info("Initializing MCPClient")
+    client = MCPClient.from_dict(config)
+    logger.info("MCPClient initialized successfully")
+except Exception as e:
+    logger.exception("Failed to initialize MCPClient")
+    raise
 
-# ✅ Delayed async initialization
-initialized = False
-@app.before_first_request
-def lazy_initialize():
-    global initialized
-    if not initialized:
-        logger.info("🔧 Lazy loading tools from MCP...")
-        asyncio.run(agent.initialize())
-        initialized = True
-        logger.info("✅ Tools loaded")
+try:
+    logger.info("Initializing ChatAnthropic")
+    llm = ChatAnthropic(
+        model="claude-3-5-sonnet-20241022",
+        api_key=ANTHROPIC_API_KEY,
+        temperature=0.7,
+        default_headers={"anthropic-beta": "tools-2024-05-16"},
+        model_kwargs={"system": SYSTEM_PROMPT},
+    )
+    logger.info("ChatAnthropic initialized successfully")
+except Exception as e:
+    logger.exception("Failed to initialize ChatAnthropic")
+    raise
 
-@app.route("/health", methods=["GET"])
-def health_check():
-    return jsonify({"status": "healthy"}), 200
+try:
+    logger.info("Initializing MCPAgent")
+    agent = MCPAgent(
+        llm=llm,
+        client=client,
+        max_steps=30,
+        verbose=True,
+    )
+    # Preload tools and log available tools
+    async def preload_tools():
+        await agent.initialize()
+        try:
+            tools_response = await client.send_request('tools/list')
+            logger.info(f"MCP Server tools: {json.dumps(tools_response.get('result', {}).get('tools', []), indent=2)}")
+        except Exception as e:
+            logger.error(f"Failed to fetch tools: {str(e)}")
+    asyncio.run(preload_tools())
+    logger.info("MCPAgent initialized successfully with preloaded tools")
+except Exception as e:
+    logger.exception("Failed to initialize MCPAgent or preload tools")
+    raise
 
-@app.route("/process_request", methods=["POST"])
-def process_request():
-    session_id = None
+# Lifespan for startup/shutdown
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    if client.sessions:
+        await client.close_all_sessions()
+        logger.info("Closed all MCP client sessions")
+
+app.lifespan = lifespan
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    logger.info("Health check requested")
+    return {"status": "healthy", "message": "FastAPI app is running"}
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest):
+    """Handle chatbot POST requests."""
+    logger.info(f"Received request: session_id={request.session_id}, message={request.message}")
+
     try:
-        data = request.get_json()
-        if not data or "user_input" not in data:
-            return jsonify({"error": "Missing user_input"}), 400
+        # Generate session_id if not provided
+        session_id = request.session_id or str(uuid.uuid4())
+        if session_id not in sessions:
+            sessions[session_id] = {
+                "conversation_history": [],
+                "original_prompt": request.message,
+                "attempts": 0,
+                "last_active": asyncio.get_event_loop().time()
+            }
 
-        session_id = data.get("session_id", str(uuid.uuid4()))
-        session = sessions.get(session_id, {
-            "conversation_history": [],
-            "original_prompt": data["user_input"],
-            "attempts": 0
-        })
+        session = sessions[session_id]
+        session["conversation_history"].append({"role": "user", "content": request.message})
+        session["last_active"] = asyncio.get_event_loop().time()
+        logger.debug(f"Session {session_id}: history: {json.dumps(session['conversation_history'], indent=2)}")
 
-        session["conversation_history"].append({"role": "user", "content": data["user_input"]})
-        prev_inputs = [m["content"] for m in session["conversation_history"] if m["role"] == "user"][1:]
-        input_content = session["original_prompt"] + "\n" + "\n".join(f"Provided: {p}" for p in prev_inputs)
+        max_attempts = 3
+        while session["attempts"] < max_attempts:
+            try:
+                # Prepare input with context
+                input_content = session["conversation_history"][-1]["content"]
+                if session["attempts"] > 0:
+                    input_content = (f"Original request: {session['original_prompt']}\n" +
+                                     "\n".join(f"Provided: {msg['content']}" for msg in session["conversation_history"] if msg["role"] == "user"))
 
-        result = asyncio.run(asyncio.wait_for(agent.run(input_content, max_steps=30), timeout=45))
-        result_text = result[0]["text"] if isinstance(result, list) and "text" in result[0] else str(result)
+                logger.debug(f"Session {session_id}: Running agent with input: {input_content}")
+                result = await asyncio.wait_for(agent.run(input_content, max_steps=30), timeout=AGENT_TIMEOUT)
+                result_text = result[0]["text"] if isinstance(result, list) and result and "text" in result[0] else str(result)
+                logger.info(f"Session {session_id}: Agent response: {result_text}")
 
-        if "please provide" in result_text.lower():
-            session["attempts"] += 1
-            if session["attempts"] >= max_attempts:
-                return jsonify({"status": "error", "message": "Too many attempts", "session_id": session_id})
-            sessions[session_id] = session
-            return jsonify({"status": "missing_parameter", "message": result_text, "session_id": session_id})
+                # Check for missing parameters
+                if "please provide" in result_text.lower() or "missing" in result_text.lower():
+                    missing_param = result_text.split("please provide ")[-1].split(".")[0].strip() if "please provide" in result_text.lower() else "required parameter"
+                    session["attempts"] += 1
+                    session["conversation_history"].append({"role": "assistant", "content": result_text})
+                    sessions[session_id] = session
+                    return ChatResponse(response=result_text, status="missing_parameter", session_id=session_id)
 
-        session["conversation_history"].append({"role": "assistant", "content": result_text})
-        sessions[session_id] = session
-        return jsonify({"status": "success", "message": result_text, "session_id": session_id})
+                # Success
+                session["conversation_history"].append({"role": "assistant", "content": result_text})
+                session["attempts"] = 0
+                session["last_active"] = asyncio.get_event_loop().time()
+                sessions[session_id] = session
+                return ChatResponse(response=result_text, status="success", session_id=session_id)
 
-    except asyncio.TimeoutError:
-        return jsonify({"status": "error", "message": "Agent timeout"}), 504
+            except asyncio.TimeoutError:
+                logger.error(f"Session {session_id}: Agent execution timed out")
+                raise HTTPException(status_code=504, detail="Request timed out. Please try again.")
+            except TypeError as e:
+                logger.exception(f"Session {session_id}: Pickling error: {str(e)}")
+                raise HTTPException(status_code=500, detail=f"Pickling error: {str(e)}. Please try again or contact support.")
+            except Exception as e:
+                logger.exception(f"Session {session_id}: Agent execution failed: {str(e)}")
+                error_str = str(e).lower()
+                try:
+                    # Fetch tool schema to identify missing parameters dynamically
+                    tools_response = await client.send_request('tools/list')
+                    tools = tools_response.get('result', {}).get('tools', [])
+                    missing_param = None
+                    for tool in tools:
+                        schema = tool.get('schema', {})
+                        required = schema.get('required', [])
+                        for param in required:
+                            if param.lower() in error_str:
+                                missing_param = param
+                                break
+                        if missing_param:
+                            break
+                    missing_param = missing_param or ("email" if "email" in error_str else "link_id" if "link_id" in error_str else "transaction_id")
+                except Exception as schema_error:
+                    logger.error(f"Failed to fetch tool schema: {str(schema_error)}")
+                    missing_param = "required parameter"
+                response_text = f"You requested: {session['original_prompt']}. Please provide the {missing_param}."
+                session["attempts"] += 1
+                session["conversation_history"].append({"role": "assistant", "content": response_text})
+                sessions[session_id] = session
+                return ChatResponse(response=response_text, status="missing_parameter", session_id=session_id)
+
+        # Max attempts reached
+        error_msg = "Maximum attempts reached. Please provide all required parameters and try again."
+        logger.error(f"Session {session_id}: {error_msg}")
+        raise HTTPException(status_code=400, detail=error_msg)
+
     except Exception as e:
-        logger.exception("Unhandled exception")
-        return jsonify({"status": "error", "message": str(e), "session_id": session_id}), 500
+        logger.exception(f"Session {session_id}: Request processing failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
-@app.teardown_appcontext
-def shutdown(exception=None):
-    try:
-        if client.sessions:
-            asyncio.run(client.close_all_sessions())
-    except Exception as e:
-        logger.exception("Error closing sessions")
-
-if __name__ == "__main__":
-    app.run(debug=True)
-
+@app.on_event("startup")
+async def cleanup_sessions():
+    """Periodically clean up old sessions (runs every hour)."""
+    async def cleanup():
+        while True:
+            current_time = asyncio.get_event_loop().time()
+            expired_sessions = [
+                sid for sid, s in sessions.items()
+                if (current_time - s["last_active"]) > 86400  # 24 hours
+                or len(s["conversation_history"]) == 0
+            ]
+            for sid in expired_sessions:
+                del sessions[sid]
+                logger.info(f"Cleaned up session: {sid}")
+            await asyncio.sleep(3600)  # Run hourly
+    asyncio.create_task(cleanup())
