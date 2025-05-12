@@ -154,17 +154,16 @@ async def health_check():
     try:
         # Create a new MCPClient for the health check
         client = MCPClient.from_dict(config)
-        # Use a generic server ID that matches the config
+        # Create and initialize a session to verify MCP server connectivity
         session = await client.create_session("http", auto_initialize=True)
-        tools_response = await session.send('tools/list')
-        mcp_status = "healthy" if tools_response.get('result', {}).get('tools') else "unavailable"
+        # Verify the MCP server's health by checking available tools
+        tools = session.tools  # Access the tools property directly
+        mcp_status = "healthy" if tools else "unavailable"
+        logger.info(f"MCP server health check: {len(tools)} tools found")
     except Exception as e:
         mcp_status = f"error: {str(e)}"
         logger.error(f"MCP server health check failed: {str(e)}")
     finally:
-        if session:
-            await session.close()
-            logger.info("Closed health check session")
         if client:
             await client.close_all_sessions()
             logger.info("Closed MCP client for health check")
