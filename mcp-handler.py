@@ -152,6 +152,19 @@ except Exception as e:
     logger.exception("Failed to initialize MCPAgent")
     raise
 
+def clean_schema(schema: dict) -> dict:
+    """Recursively clean a schema to remove unpicklable objects like Futures."""
+    if isinstance(schema, dict):
+        return {k: clean_schema(v) for k, v in schema.items()}
+    elif isinstance(schema, list):
+        return [clean_schema(item) for item in schema]
+    elif isinstance(schema, (str, int, float, bool, type(None))):
+        return schema
+    else:
+        # Replace unpicklable objects (e.g., Futures) with None or a safe default
+        logger.warning(f"Replacing unpicklable object of type {type(schema)} with None")
+        return None
+
 # Lifespan for startup/shutdown
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -160,9 +173,22 @@ async def lifespan(app: FastAPI):
         try:
             await agent.initialize()
             tools_response = await client.send_request('tools/list')
-            logger.info(f"MCP Server tools: {json.dumps(tools_response.get('result', {}).get('tools', []), indent=2)}")
+            tools = tools_response.get('result', {}).get('tools', [])
+            logger.info(f"MCP Server tools: {json.dumps(tools, indent=2)}")
+            # Pre-create LangChain tools to catch pickling issues early
+            for tool in tools:
+                try:
+                    cleaned_schema = clean_schema(tool.get('schema', {}))
+                    tool['schema'] = cleaned_schema
+                    # Simulate tool conversion (mimics LangChainAdapter)
+                    # This ensures tools are created without Futures
+                    await agent.adapter.create_tools(client)
+                except Exception as e:
+                    logger.error(f"Failed to process tool {tool.get('name')}: {str(e)}")
+            logger.info("Successfully preloaded and validated tools")
         except Exception as e:
-            logger.error(f"Failed to fetch tools: {str(e)}")
+            logger.error(f"Failed to preload tools: {str(e)}")
+    
     await preload_tools()
     logger.info("MCPAgent initialized successfully with preloaded tools")
     
@@ -179,7 +205,12 @@ app.lifespan = lifespan
 async def health_check():
     """Health check endpoint."""
     logger.info("Health check requested")
-    return {"status": "healthy", "message": "FastAPI app is running"}
+    try:
+        tools_response = await client.send_request('tools/list')
+        mcp_status = "healthy" if tools_response.get('result', {}).get('tools') else "unavailable"
+    except Exception as e:
+        mcp_status = f"error: {str(e)}"
+    return {"status": "healthy", "message": "FastAPI app is running", "mcp_status": mcp_status}
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
@@ -236,7 +267,20 @@ async def chat(request: ChatRequest):
                 raise HTTPException(status_code=504, detail="Request timed out. Please try again.")
             except TypeError as e:
                 logger.exception(f"Session {session_id}: Pickling error: {str(e)}")
-                raise HTTPException(status_code=500, detail=f"Pickling error: {str(e)}. Please try again or contact support.")
+                # Attempt to reinitialize agent with cleaned tools
+                try:
+                    await agent.initialize()
+                    tools_response = await client.send_request('tools/list')
+                    tools = tools_response.get('result', {}).get('tools', [])
+                    for tool in tools:
+                        tool['schema'] = clean_schema(tool.get('schema', {}))
+                    await agent.adapter.create_tools(client)
+                    logger.info(f"Session {session_id}: Reinitialized agent after pickling error")
+                    session["attempts"] += 1
+                    continue
+                except Exception as reinitialize_error:
+                    logger.error(f"Session {session_id}: Reinitialization failed: {str(reinitialize_error)}")
+                    raise HTTPException(status_code=500, detail=f"Pickling error: {str(e)}. Reinitialization failed: {str(reinitialize_error)}")
             except Exception as e:
                 logger.exception(f"Session {session_id}: Agent execution failed: {str(e)}")
                 error_str = str(e).lower()
