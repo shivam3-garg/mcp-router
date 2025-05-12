@@ -36,7 +36,7 @@ if not ANTHROPIC_API_KEY:
     logger.error("ANTHROPIC_API_KEY not set in environment variables")
     raise ValueError("ANTHROPIC_API_KEY is required")
 
-# System prompt (from original local code)
+# System prompt
 SYSTEM_PROMPT = """
 You are a Paytm MCP Assistant, an AI agent powered by the Paytm MCP Server, which enables secure access to Paytm's Payments and Business Payments APIs. Your role is to automate payment workflows using the available tools: `create_link`, `fetch_link`, and `fetch_transaction`. Follow these steps for every request:
 
@@ -148,24 +148,27 @@ try:
         max_steps=30,
         verbose=True,
     )
-    # Preload tools and log available tools
-    async def preload_tools():
-        await agent.initialize()
-        try:
-            tools_response = await client.send_request('tools/list')
-            logger.info(f"MCP Server tools: {json.dumps(tools_response.get('result', {}).get('tools', []), indent=2)}")
-        except Exception as e:
-            logger.error(f"Failed to fetch tools: {str(e)}")
-    asyncio.run(preload_tools())
-    logger.info("MCPAgent initialized successfully with preloaded tools")
 except Exception as e:
-    logger.exception("Failed to initialize MCPAgent or preload tools")
+    logger.exception("Failed to initialize MCPAgent")
     raise
 
 # Lifespan for startup/shutdown
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Startup: Preload tools
+    async def preload_tools():
+        try:
+            await agent.initialize()
+            tools_response = await client.send_request('tools/list')
+            logger.info(f"MCP Server tools: {json.dumps(tools_response.get('result', {}).get('tools', []), indent=2)}")
+        except Exception as e:
+            logger.error(f"Failed to fetch tools: {str(e)}")
+    await preload_tools()
+    logger.info("MCPAgent initialized successfully with preloaded tools")
+    
     yield
+    
+    # Shutdown: Clean up
     if client.sessions:
         await client.close_all_sessions()
         logger.info("Closed all MCP client sessions")
